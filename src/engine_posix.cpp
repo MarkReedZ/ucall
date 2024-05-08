@@ -37,6 +37,7 @@
 
 #include <charconv> // `std::to_chars`
 #include <chrono>   // `std::chrono`
+#include <map>
 
 #include "mbedtls/config.h"
 #include <mbedtls/ctr_drbg.h>
@@ -137,8 +138,9 @@ struct engine_t {
     descriptor_t connection{};
     /// @brief A small memory buffer to store small requests.
     alignas(align_k) char packet_buffer[ram_page_size_k + sj::SIMDJSON_PADDING]{};
-    /// @brief An array of function callbacks. Can be in dozens.
-    array_gt<named_callback_t> callbacks{};
+    /// @brief A map of function callbacks. 
+    std::map<std::string_view, named_callback_t> cbmap{};
+
     /// @brief Statically allocated memory to process small requests.
     scratch_space_t scratch{};
     /// @brief For batch-requests in synchronous connections we need a place to
@@ -188,7 +190,7 @@ void send_message(engine_t& engine, array_gt<char> const& message) noexcept {
 
 void forward_call(engine_t& engine) noexcept {
     scratch_space_t& scratch = engine.scratch;
-    auto callback_or_error = find_callback(engine.callbacks, scratch);
+    auto callback_or_error = find_callback(engine.cbmap, scratch);
     if (auto error_ptr = std::get_if<default_error_t>(&callback_or_error); error_ptr)
         return ucall_call_reply_error(&engine, error_ptr->code, error_ptr->note.data(), error_ptr->note.size());
 
@@ -446,7 +448,6 @@ void ucall_init(ucall_config_t* config_inout, ucall_server_t* server_out) {
     int socket_descriptor{-1};
     engine_t* server_ptr = nullptr;
     array_gt<char> buffer;
-    array_gt<named_callback_t> embedded_callbacks;
     ucall_ssl_context_t* ssl_context = nullptr;
     sjd::parser parser;
 
@@ -461,8 +462,6 @@ void ucall_init(ucall_config_t* config_inout, ucall_server_t* server_out) {
     if (!server_ptr)
         goto cleanup;
     if (!buffer.reserve(initial_buffer_size_k))
-        goto cleanup;
-    if (!embedded_callbacks.reserve(config.max_callbacks))
         goto cleanup;
     socket_descriptor = socket(AF_INET, SOCK_STREAM, 0);
     if (socket_descriptor < 0)
@@ -487,7 +486,6 @@ void ucall_init(ucall_config_t* config_inout, ucall_server_t* server_out) {
     // Initialize all the members.
     new (server_ptr) engine_t();
     server_ptr->socket = descriptor_t{socket_descriptor};
-    server_ptr->callbacks = std::move(embedded_callbacks);
     server_ptr->scratch.parser = std::move(parser);
     server_ptr->buffer = std::move(buffer);
     server_ptr->logs_file_descriptor = config.logs_file_descriptor;
@@ -509,8 +507,7 @@ cleanup:
 void ucall_add_procedure(ucall_server_t server, ucall_str_t name, ucall_callback_t callback,
                          ucall_callback_tag_t callback_tag) {
     engine_t& engine = *reinterpret_cast<engine_t*>(server);
-    if (engine.callbacks.size() + 1 < engine.callbacks.capacity())
-        engine.callbacks.push_back_reserved({name, callback, callback_tag});
+    engine.cbmap[name] = {name, callback, callback_tag}; 
 }
 
 void ucall_take_calls(ucall_server_t server, uint16_t) {
