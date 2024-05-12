@@ -374,6 +374,7 @@ void ucall_init(ucall_config_t* config_inout, ucall_server_t* server_out) {
         registered_buffers[i * 2u + 1u].iov_base = outputs;
         registered_buffers[i * 2u + 1u].iov_len = ram_page_size_k;
     }
+/*
     uring_result = io_uring_register_files_sparse(&uring, config.max_concurrent_connections);
     if (uring_result != 0)
         goto cleanup;
@@ -381,10 +382,12 @@ void ucall_init(ucall_config_t* config_inout, ucall_server_t* server_out) {
         io_uring_register_buffers(&uring, registered_buffers.data(), static_cast<unsigned>(registered_buffers.size()));
     if (uring_result != 0)
         goto cleanup;
+*/
 
     // Configure the socket.
     // In the past we would use the normal POSIX call, but we should prefer direct descriptors over it.
     // socket_descriptor = socket(AF_INET, SOCK_STREAM, 0);
+/*
     uring_sqe = io_uring_get_sqe(&uring);
     io_uring_prep_socket_direct(uring_sqe, AF_INET, SOCK_STREAM, 0, IORING_FILE_INDEX_ALLOC, 0);
     uring_result = io_uring_submit_and_wait(&uring, 1);
@@ -392,6 +395,14 @@ void ucall_init(ucall_config_t* config_inout, ucall_server_t* server_out) {
     socket_descriptor = uring_cqe->res;
     if (socket_descriptor < 0)
         goto cleanup;
+*/
+    if ((socket_descriptor = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0)) == -1) {
+      printf("socket error : %d ...\n", errno);
+      exit(EXIT_FAILURE);
+    }
+    if (socket_descriptor < 0) { fprintf(stderr, "Prep socket failed %d %s\n", socket_descriptor); goto cleanup; }
+
+
     // Not sure if this is required, after we have a kernel with `IORING_OP_SENDMSG_ZC` support, we can check.
     // if (setsockopt(socket_descriptor, SOL_SOCKET, SO_ZEROCOPY, &socket_options, sizeof(socket_options)) == -1)
     //     goto cleanup;
@@ -791,10 +802,15 @@ bool engine_t::consider_accepting_new_connection() noexcept {
     connection.stage = stage_t::waiting_to_accept_k;
     submission_mutex.lock();
 
+    //uring_sqe = io_uring_get_sqe(&uring);
+    //io_uring_prep_accept_direct(uring_sqe, socket, &connection.client_address, &connection.client_address_len, 0,
+                                //IORING_FILE_INDEX_ALLOC);
+    //io_uring_sqe_set_data(uring_sqe, &connection);
     uring_sqe = io_uring_get_sqe(&uring);
-    io_uring_prep_accept_direct(uring_sqe, socket, &connection.client_address, &connection.client_address_len, 0,
-                                IORING_FILE_INDEX_ALLOC);
+    io_uring_prep_accept(uring_sqe, socket, &connection.client_address, &connection.client_address_len, 0);
+                                //IORING_FILE_INDEX_ALLOC);
     io_uring_sqe_set_data(uring_sqe, &connection);
+
 
     // Accepting new connections can be time-less.
     // io_uring_sqe_set_flags(uring_sqe, IOSQE_IO_LINK);
@@ -920,19 +936,23 @@ void automata_t::receive_next() noexcept {
     //
     // In this case we are waiting for an actual data, not some artificial wakeup.
     uring_sqe = io_uring_get_sqe(&engine.uring);
-    io_uring_prep_read_fixed(uring_sqe, int(connection.descriptor), (void*)pipes.next_input_address(),
-                             pipes.next_input_length(), 0, engine.connections.offset_of(connection) * 2u);
+    //io_uring_prep_read_fixed(uring_sqe, int(connection.descriptor), (void*)pipes.next_input_address(),
+                             //pipes.next_input_length(), 0, engine.connections.offset_of(connection) * 2u);
+    io_uring_prep_read(uring_sqe, int(connection.descriptor), (void*)pipes.next_input_address(),
+                             pipes.next_input_length(), 0);
     io_uring_sqe_set_data(uring_sqe, &connection);
-    io_uring_sqe_set_flags(uring_sqe, IOSQE_IO_LINK);
+    //io_uring_sqe_set_flags(uring_sqe, IOSQE_IO_LINK);
 
     // More than other operations this depends on the information coming from the client.
     // We can't afford to keep connections alive indefinitely, so we need to set a timeout
     // on this operation.
     // The `io_uring_prep_link_timeout` is a convenience method for poorly documented `IORING_OP_LINK_TIMEOUT`.
+/*
     uring_sqe = io_uring_get_sqe(&engine.uring);
     io_uring_prep_link_timeout(uring_sqe, &connection.next_wakeup, 0);
     io_uring_sqe_set_data(uring_sqe, NULL);
     io_uring_sqe_set_flags(uring_sqe, 0);
+*/
     uring_result = io_uring_submit(&engine.uring);
 
     engine.submission_mutex.unlock();
