@@ -37,13 +37,7 @@
 
 #include <charconv> // `std::to_chars`
 #include <chrono>   // `std::chrono`
-
-#include "mbedtls/config.h"
-#include <mbedtls/ctr_drbg.h>
-#include <mbedtls/entropy.h>
-#include <mbedtls/net_sockets.h>
-#include <mbedtls/ssl.h>
-#include <mbedtls/ssl_cache.h>
+#include <map>
 
 #include "ucall/ucall.h"
 
@@ -51,6 +45,7 @@
 #include "helpers/parse.hpp"
 #include "helpers/reply.hpp"
 #include "helpers/shared.hpp"
+#include "helpers/net.hpp"
 
 using namespace unum::ucall;
 
@@ -59,86 +54,18 @@ using time_point_t = std::chrono::time_point<time_clock_t>;
 
 static constexpr std::size_t initial_buffer_size_k = ram_page_size_k * 4;
 
-struct ucall_ssl_context_t {
-
-    ~ucall_ssl_context_t() noexcept {
-        mbedtls_x509_crt_free(&srvcert);
-        mbedtls_pk_free(&pkey);
-        mbedtls_ssl_free(&ssl);
-        mbedtls_ssl_config_free(&conf);
-        mbedtls_ssl_cache_free(&cache);
-        mbedtls_ctr_drbg_free(&ctr_drbg);
-        mbedtls_entropy_free(&entropy);
-    }
-
-    int init(const char* pk_path, const char** crts_path, size_t crts_cnt) {
-        mbedtls_ssl_init(&ssl);
-        mbedtls_ssl_config_init(&conf);
-        mbedtls_ssl_cache_init(&cache);
-        mbedtls_x509_crt_init(&srvcert);
-        mbedtls_pk_init(&pkey);
-        mbedtls_entropy_init(&entropy);
-        mbedtls_ctr_drbg_init(&ctr_drbg);
-        int ret = 0;
-
-        // Seed the RNG
-        if ((ret = mbedtls_ctr_drbg_seed(&ctr_drbg, mbedtls_entropy_func, &entropy, NULL, 0)) != 0)
-            // TODO Use personalization string. Required or Optional ?
-            return ret;
-
-        // Load Private Key
-        if ((ret = mbedtls_pk_parse_keyfile(&pkey, pk_path, NULL, NULL, &ctr_drbg)) != 0)
-            // TODO Use Password. Required or Optional ?
-            return ret;
-
-        // Load Certificates
-        for (size_t i = 0; i < crts_cnt; ++i)
-            if ((ret = mbedtls_x509_crt_parse_file(&srvcert, crts_path[i])) != 0)
-                // TODO Notify which certificate was invalid ?
-                return ret;
-
-        if ((ret = mbedtls_ssl_config_defaults(&conf, MBEDTLS_SSL_IS_SERVER, MBEDTLS_SSL_TRANSPORT_STREAM,
-                                               MBEDTLS_SSL_PRESET_DEFAULT)) != 0)
-            return ret;
-
-        mbedtls_ssl_conf_rng(&conf, mbedtls_ctr_drbg_random, &ctr_drbg);
-
-        mbedtls_ssl_conf_session_cache(&conf, &cache, mbedtls_ssl_cache_get, mbedtls_ssl_cache_set);
-        mbedtls_ssl_conf_renegotiation(&conf, MBEDTLS_SSL_RENEGOTIATION_DISABLED);
-
-        mbedtls_ssl_conf_ca_chain(&conf, srvcert.next, NULL);
-        if ((ret = mbedtls_ssl_conf_own_cert(&conf, &srvcert, &pkey)) != 0)
-            return ret;
-
-        if ((ret = mbedtls_ssl_setup(&ssl, &conf)) != 0)
-            return ret;
-
-        return 0;
-    }
-
-    mbedtls_ssl_context ssl{};
-    mbedtls_ssl_config conf{};
-    mbedtls_pk_context pkey{};
-    mbedtls_x509_crt srvcert{};
-    mbedtls_entropy_context entropy{};
-    mbedtls_ssl_cache_context cache{};
-    mbedtls_ctr_drbg_context ctr_drbg{};
-};
-
 struct engine_t {
-    ~engine_t() noexcept { delete ssl_ctx; }
+    ~engine_t() noexcept { }
 
-    descriptor_t socket{};
-
-    /// @brief Establishes an SSL connection if SSL is enabled, otherwise the `ssl_ctx` is unused and uninitialized.
-    ucall_ssl_context_t* ssl_ctx = nullptr;
+    int socket{};
 
     /// @brief The file descriptor of the stateful connection over TCP.
     descriptor_t connection{};
     /// @brief A small memory buffer to store small requests.
     alignas(align_k) char packet_buffer[ram_page_size_k + sj::SIMDJSON_PADDING]{};
-    /// @brief An array of function callbacks. Can be in dozens.
-    array_gt<named_callback_t> callbacks{};
+    /// @brief A map of function callbacks. 
+    std::map<std::string_view, named_callback_t> cbmap{};
+
     /// @brief Statically allocated memory to process small requests.
     scratch_space_t scratch{};
     /// @brief For batch-requests in synchronous connections we need a place to
@@ -164,31 +91,19 @@ sj::simdjson_result<sjd::element> param_at(ucall_call_t call, size_t position) n
 }
 
 void send_message(engine_t& engine, array_gt<char> const& message) noexcept {
-    char const* buf = message.data();
-    size_t const len = message.size();
-    long idx = 0;
-    long res = 0;
-
-    if (engine.ssl_ctx)
-        while (idx < len && (res = mbedtls_ssl_write(&engine.ssl_ctx->ssl, reinterpret_cast<uint8_t const*>(buf + idx),
-                                                     (len - idx))) > 0)
-            idx += res;
-    else
-        while (idx < len && (res = send(engine.connection, buf + idx, len - idx, 0)) > 0)
-            idx += res;
-
+    int res = net_send_message( engine.connection, message );
     if (res < 0) {
         if (errno == EMSGSIZE)
             ucall_call_reply_error_out_of_memory(&engine);
         return;
     }
-    engine.stats.bytes_sent += idx;
+    engine.stats.bytes_sent += message.size();
     engine.stats.packets_sent++;
 }
 
 void forward_call(engine_t& engine) noexcept {
     scratch_space_t& scratch = engine.scratch;
-    auto callback_or_error = find_callback(engine.callbacks, scratch);
+    auto callback_or_error = find_callback(engine.cbmap, scratch);
     if (auto error_ptr = std::get_if<default_error_t>(&callback_or_error); error_ptr)
         return ucall_call_reply_error(&engine, error_ptr->code, error_ptr->note.data(), error_ptr->note.size());
 
@@ -199,13 +114,16 @@ void forward_call(engine_t& engine) noexcept {
 /**
  * @brief Analyzes the contents of the packet, bifurcating batched and singular JSON-RPC requests.
  */
-void forward_call_or_calls(engine_t& engine) noexcept {
+int forward_call_or_calls(engine_t& engine) noexcept {
     scratch_space_t& scratch = engine.scratch;
     sjd::parser& parser = *scratch.dynamic_parser;
     std::string_view json_body = scratch.dynamic_packet;
-    auto one_or_many = parser.parse(json_body.data(), json_body.size(), false);
-    if (one_or_many.error() != sj::SUCCESS)
-        return ucall_call_reply_error(&engine, -32700, "Invalid JSON was received by the server.", 40);
+    auto doc = parser.parse(json_body.data(), json_body.size(), false);
+
+    if (doc.error() != sj::SUCCESS) {
+        //if ( doc.error() ) printf(" error %d %s\n", doc.error(), simdjson::error_message(doc.error()));
+        return -2; //ucall_call_reply_error(&engine, -32700, "Invalid JSON was received by the server.", 40);
+    }
 
     // The major difference between batch and single-request paths is that
     // in the first case we need to keep a copy of the data somewhere,
@@ -213,8 +131,8 @@ void forward_call_or_calls(engine_t& engine) noexcept {
     // simultaneously.
     // Linux supports `MSG_MORE` flag for submissions, which could have helped,
     // but it is less effective than assembling a copy here.
-    if (one_or_many.is_array()) {
-        sjd::array many = one_or_many.get_array().value_unsafe();
+    if (doc.is_array()) {
+        sjd::array many = doc.get_array().value_unsafe();
         scratch.is_batch = false;
 
         // Start a JSON array.
@@ -235,8 +153,10 @@ void forward_call_or_calls(engine_t& engine) noexcept {
 
         res &= engine.buffer.append_n("]", 1);
 
-        if (!res)
-            return ucall_call_reply_error_out_of_memory(&engine);
+        if (!res) {
+            ucall_call_reply_error_out_of_memory(&engine); 
+            return 0;
+        }
 
         if (scratch.is_http)
             set_http_content_length(engine.buffer.data(), engine.buffer.size() - http_header_size_k);
@@ -246,54 +166,41 @@ void forward_call_or_calls(engine_t& engine) noexcept {
         engine.buffer.reset();
     } else {
         scratch.is_batch = false;
-        scratch.tree = one_or_many.value_unsafe();
+        scratch.tree = doc.value_unsafe();
         forward_call(engine);
         engine.buffer.reset();
     }
+    return 0;
 }
 
 void forward_packet(engine_t& engine) noexcept {
     scratch_space_t& scratch = engine.scratch;
     auto json_or_error = split_body_headers(scratch.dynamic_packet);
-    if (auto error_ptr = std::get_if<default_error_t>(&json_or_error); error_ptr)
+    if (auto error_ptr = std::get_if<default_error_t>(&json_or_error); error_ptr){
         return ucall_call_reply_error(&engine, error_ptr->code, error_ptr->note.data(), error_ptr->note.size());
+    }
 
     auto request = std::get<parsed_request_t>(json_or_error);
     scratch.is_http = request.type.size();
     scratch.dynamic_packet = request.body;
-    return forward_call_or_calls(engine);
-}
-
-int ssl_send(void* ctx, const unsigned char* buf, size_t len) {
-    mbedtls_net_context* conn = reinterpret_cast<mbedtls_net_context*>(ctx);
-    ssize_t ret = send(conn->fd, reinterpret_cast<char const*>(buf), len, 0);
-    return ret;
-}
-
-int ssl_recv(void* ctx, unsigned char* buf, size_t len) {
-    mbedtls_net_context* conn = reinterpret_cast<mbedtls_net_context*>(ctx);
-    ssize_t ret = recv(conn->fd, reinterpret_cast<char*>(buf), len, 0);
-    return ret;
+    forward_call_or_calls(engine);
 }
 
 int recv_all(engine_t& engine, char* buf, size_t len) {
     size_t idx = 0;
     int res = 0;
 
-    if (engine.ssl_ctx)
-        while (idx < len &&
-               (res = mbedtls_ssl_read(&engine.ssl_ctx->ssl, reinterpret_cast<uint8_t*>(buf + idx), (len - idx))) > 0)
-            idx += res;
-    else
-        while (idx < len && (res = recv(engine.connection, buf + idx, len - idx, 0)) > 0)
-            idx += res;
+    while (idx < len && (res = recv(engine.connection, buf + idx, len - idx, 0)) > 0)
+        idx += res;
 
     return idx;
 }
 
-void ucall_take_call(ucall_server_t server, uint16_t) {
-    engine_t& engine = *reinterpret_cast<engine_t*>(server);
+int on_data(conn_t *conn, char *buf, int data_left) {
+    //printf("DELME on_data sz %d str:\n%.*s\n", data_left, data_left, buf);
+    engine_t& engine = *reinterpret_cast<engine_t*>(conn->user_data);
     scratch_space_t& scratch = engine.scratch;
+    engine.connection = descriptor_t{conn->fd};
 
     // Log stats, if enough time has passed since last call.
     if (engine.logs_file_descriptor > 0) {
@@ -308,112 +215,51 @@ void ucall_take_call(ucall_server_t server, uint16_t) {
         }
     }
 
-    // If no pending connections are present on the queue, and the
-    // socket is not marked as nonblocking, accept() blocks the caller
-    // until a connection is present. If the socket is marked
-    // nonblocking and no pending connections are present on the queue,
-    // accept() fails with the error EAGAIN or EWOULDBLOCK.
-    int connection_fd = accept(engine.socket, (struct sockaddr*)NULL, NULL);
-    if (connection_fd < 0) {
-        // Drop the last error.
-        errno;
-        return;
-    }
+        
+    if ( buf[0] == '{' || buf[0] == '[' ) { // JSON
 
-    mbedtls_net_context client_ctx;
-
-    if (engine.ssl_ctx) {
-        client_ctx.fd = connection_fd;
-        mbedtls_ssl_set_bio(&engine.ssl_ctx->ssl, &client_ctx, ssl_send, ssl_recv, NULL);
-        int ret = 0;
-        while ((ret = mbedtls_ssl_handshake(&engine.ssl_ctx->ssl)) != 0)
-            if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
-                mbedtls_net_free(&client_ctx);
-                mbedtls_ssl_session_reset(&engine.ssl_ctx->ssl);
-                return;
-            }
-    }
-
-    // Wait until we have input.
-    engine.connection = descriptor_t{connection_fd};
-    engine.stats.added_connections++;
-    engine.stats.closed_connections++;
-    char* buffer_ptr = &engine.packet_buffer[0];
-
-    size_t bytes_received = 0, bytes_expected = 0;
-    if (engine.ssl_ctx)
-        bytes_received =
-            mbedtls_ssl_read(&engine.ssl_ctx->ssl, reinterpret_cast<uint8_t*>(buffer_ptr), http_head_max_size_k);
-    else
-        bytes_received = recv(engine.connection, buffer_ptr, http_head_max_size_k, 0);
-
-    auto json_or_error = split_body_headers(std::string_view(buffer_ptr, bytes_received));
-    if (auto error_ptr = std::get_if<default_error_t>(&json_or_error); error_ptr)
-        return ucall_call_reply_error(&engine, error_ptr->code, error_ptr->note.data(), error_ptr->note.size());
-    parsed_request_t request = std::get<parsed_request_t>(json_or_error);
-    auto res = std::from_chars(request.content_length.data(),
-                               request.content_length.data() + request.content_length.size(), bytes_expected);
-    bytes_expected += (request.body.data() - buffer_ptr);
-
-    if (res.ec == std::errc::invalid_argument || bytes_expected <= 0)
-#if !defined(UCALL_IS_WINDOWS)
-        if (ioctl(engine.connection, FIONREAD, &bytes_expected) == -1 || bytes_expected == 0)
-#endif
-            bytes_expected = bytes_received; // TODO what?
-
-    // Either process it in the statically allocated memory,
-    // or allocate dynamically, if the message is too long.
-    size_t bytes_left = bytes_expected - bytes_received;
-
-    if (bytes_expected <= ram_page_size_k) {
-        bytes_received += recv_all(engine, buffer_ptr + bytes_received, bytes_left);
         scratch.dynamic_parser = &scratch.parser;
-        scratch.dynamic_packet = std::string_view(buffer_ptr, bytes_received);
-        engine.stats.bytes_received += bytes_received;
+        scratch.dynamic_packet = std::string_view(buf, data_left);
+        engine.stats.bytes_received += data_left;
         engine.stats.packets_received++;
-        forward_packet(engine);
+        //forward_packet(engine);
+        scratch.is_http = false;
+        int ret = forward_call_or_calls(engine);
+        if ( ret == -2 ) {
+            return data_left;
+        } 
+        
     } else {
-        sjd::parser parser;
-        if (parser.allocate(bytes_expected, bytes_expected / 2) != sj::SUCCESS)
-            return ucall_call_reply_error_out_of_memory(&engine);
 
-#if defined(UCALL_IS_WINDOWS)
-        buffer_ptr = (char*)_aligned_malloc(round_up_to<align_k>(bytes_expected + sj::SIMDJSON_PADDING), align_k);
-#else
-        buffer_ptr = (char*)std::aligned_alloc(align_k, round_up_to<align_k>(bytes_expected + sj::SIMDJSON_PADDING));
-#endif
-        if (!buffer_ptr)
-            return ucall_call_reply_error_out_of_memory(&engine);
 
-        memcpy(buffer_ptr, &engine.packet_buffer[0], bytes_received);
-
-        bytes_received += recv_all(engine, buffer_ptr + bytes_received, bytes_left);
-        scratch.dynamic_parser = &parser;
-        scratch.dynamic_packet = std::string_view(buffer_ptr, bytes_received);
-        engine.stats.bytes_received += bytes_received;
-        engine.stats.packets_received++;
-        forward_packet(engine);
-#if defined(UCALL_IS_WINDOWS)
-        _aligned_free(buffer_ptr);
-#else
-        std::free(buffer_ptr);
-#endif
-        buffer_ptr = nullptr;
+        auto json_or_error = split_body_headers(std::string_view(buf, data_left));
+        if (auto error_ptr = std::get_if<default_error_t>(&json_or_error); error_ptr) {
+            ucall_call_reply_error(&engine, error_ptr->code, error_ptr->note.data(), error_ptr->note.size());
+            return 0;
+        }
+        size_t bytes_expected = 0;
+        parsed_request_t request = std::get<parsed_request_t>(json_or_error);
+        auto res = std::from_chars(request.content_length.data(),
+                                request.content_length.data() + request.content_length.size(), bytes_expected);
+        bytes_expected += (request.body.data() - buf);
+    
+        size_t bytes_left = bytes_expected - data_left;
+    
+        // TODO What if the json is short
+        if (bytes_expected <= ram_page_size_k) {
+            //data_left += recv_all(engine, buffer_ptr + bytes_received, bytes_left);
+            scratch.dynamic_parser = &scratch.parser;
+            scratch.dynamic_packet = std::string_view(buf, data_left);
+            engine.stats.bytes_received += data_left;
+            engine.stats.packets_received++;
+            forward_packet(engine);
+        }
     }
 
-    if (engine.ssl_ctx) {
-        int ret = 0;
-        while ((ret = mbedtls_ssl_close_notify(&engine.ssl_ctx->ssl)) < 0)
-            if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE)
-                break;
-
-        mbedtls_ssl_session_reset(&engine.ssl_ctx->ssl);
-    }
-    shutdown(connection_fd, SHUT_WR);
-    // If later on some UB is detected for client not recieving full data,
-    // then it may be required to put a `recv` with timeout between `shutdown` and `close`
-    close(connection_fd);
+    return 0;
 }
+
+void ucall_take_call(ucall_server_t server, uint16_t) { } // TODO?
 
 void ucall_init(ucall_config_t* config_inout, ucall_server_t* server_out) {
 
@@ -431,9 +277,6 @@ void ucall_init(ucall_config_t* config_inout, ucall_server_t* server_out) {
         config.max_callbacks = 128u;
     if (!config.hostname)
         config.hostname = "0.0.0.0";
-    if (config.use_ssl &&
-        !(config.ssl_private_key_path || config.ssl_certificates_paths || config.ssl_certificates_count))
-        return;
 
     // Some limitations are hard-coded for this non-concurrent implementation
     config.max_threads = 1u;
@@ -442,19 +285,10 @@ void ucall_init(ucall_config_t* config_inout, ucall_server_t* server_out) {
     config.max_lifetime_exchanges = 1u;
 
     int received_errno{};
-    int socket_options{1};
-    int socket_descriptor{-1};
+    int fd;
     engine_t* server_ptr = nullptr;
     array_gt<char> buffer;
-    array_gt<named_callback_t> embedded_callbacks;
-    ucall_ssl_context_t* ssl_context = nullptr;
     sjd::parser parser;
-
-    // By default, let's open TCP port for IPv4.
-    struct sockaddr_in address;
-    address.sin_family = AF_INET;
-    address.sin_addr.s_addr = inet_addr(config.hostname);
-    address.sin_port = htons(config.port);
 
     // Try allocating all the necessary memory.
     server_ptr = (engine_t*)std::malloc(sizeof(engine_t));
@@ -462,66 +296,50 @@ void ucall_init(ucall_config_t* config_inout, ucall_server_t* server_out) {
         goto cleanup;
     if (!buffer.reserve(initial_buffer_size_k))
         goto cleanup;
-    if (!embedded_callbacks.reserve(config.max_callbacks))
+
+    fd = net_init(config, on_data);
+    if ( fd <= 0 )
         goto cleanup;
-    socket_descriptor = socket(AF_INET, SOCK_STREAM, 0);
-    if (socket_descriptor < 0)
-        goto cleanup;
-    // Optionally configure the socket, but don't always expect it to succeed.
-    if (setsockopt(socket_descriptor, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT,
-                   reinterpret_cast<char const*>(&socket_options), sizeof(socket_options)) == -1)
-        errno;
-    if (bind(socket_descriptor, (struct sockaddr*)&address, sizeof(address)) < 0)
-        goto cleanup;
-    if (listen(socket_descriptor, config.queue_depth) < 0)
-        goto cleanup;
-    if (config.use_ssl) {
-        ssl_context = new ucall_ssl_context_t();
-        if (ssl_context->init(config.ssl_private_key_path, config.ssl_certificates_paths,
-                              config.ssl_certificates_count) != 0)
-            goto cleanup;
-    }
-    if (parser.allocate(ram_page_size_k, ram_page_size_k / 2) != sj::SUCCESS)
+
+    if (parser.allocate(4*ram_page_size_k, ram_page_size_k / 2) != sj::SUCCESS)
         goto cleanup;
 
     // Initialize all the members.
     new (server_ptr) engine_t();
-    server_ptr->socket = descriptor_t{socket_descriptor};
-    server_ptr->callbacks = std::move(embedded_callbacks);
+    server_ptr->socket = fd;
     server_ptr->scratch.parser = std::move(parser);
     server_ptr->buffer = std::move(buffer);
     server_ptr->logs_file_descriptor = config.logs_file_descriptor;
     server_ptr->logs_format = config.logs_format ? std::string_view(config.logs_format) : std::string_view();
     server_ptr->log_last_time = time_clock_t::now();
-    server_ptr->ssl_ctx = ssl_context;
     *server_out = (ucall_server_t)server_ptr;
     return;
 
 cleanup:
     received_errno = errno;
-    if (socket_descriptor >= 0)
-        close(socket_descriptor);
     std::free(server_ptr);
     *server_out = nullptr;
-    delete ssl_context;
 }
 
 void ucall_add_procedure(ucall_server_t server, ucall_str_t name, ucall_callback_t callback,
                          ucall_callback_tag_t callback_tag) {
     engine_t& engine = *reinterpret_cast<engine_t*>(server);
-    if (engine.callbacks.size() + 1 < engine.callbacks.capacity())
-        engine.callbacks.push_back_reserved({name, callback, callback_tag});
+    engine.cbmap[name] = {name, callback, callback_tag};
+
 }
 
 void ucall_take_calls(ucall_server_t server, uint16_t) {
-    while (true)
-        ucall_take_call(server, 0);
+    engine_t& engine = *reinterpret_cast<engine_t*>(server);
+    net_run(&engine);
+    //while (true)
+        //ucall_take_call(server, 0);
 }
 
 void ucall_free(ucall_server_t server) {
     if (!server)
         return;
 
+    net_shutdown(server);
     engine_t* engine = reinterpret_cast<engine_t*>(server);
     close(engine->socket);
     delete engine;
